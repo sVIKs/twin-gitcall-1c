@@ -98,6 +98,24 @@ def _window_oneshot(path, fmt, scope, rep):
     return raw
 
 
+def _people_rows(path):
+    """Extract real employees (ФИО + code) from the 1C «Сотрудники» catalog rows.
+    Universal: matches any catalog whose title looks like employees/staff/persons."""
+    ex = EX.TwinExtractor(path)
+    out = []
+    for o in ex.objects():
+        low = (o.get("title") or "").lower()
+        if any(k in low for k in ("сотруд", "работн", "персон", "employee", "кадр")):
+            for row in ex.tables[o["phys"]]:
+                d = row.as_dict() if hasattr(row, "as_dict") else {}
+                fio = (d.get("_DESCRIPTION") or d.get("_Description") or "").strip()
+                code = (d.get("_CODE") or d.get("_Code") or "").strip()
+                if fio:
+                    out.append({"code": code, "fio": fio})
+            break
+    return out
+
+
 def usercode(data, context=None):
     try:
         source = data.get("source_url") or data.get("source")
@@ -108,6 +126,10 @@ def usercode(data, context=None):
             scope = "full"
         cursor = data.get("cursor") or None
         path = _ensure_file(source)
+        if (data.get("mode") or "").lower() == "people":
+            data["employees"] = _people_rows(path)
+            data["done"] = True; data["count"] = len(data["employees"])
+            data.pop("twin_error", None); return data
         fmt = (cursor or {}).get("fmt") or AN.detect_format(path)
 
         if fmt == "1cd":
