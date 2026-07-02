@@ -127,9 +127,11 @@ def usercode(data, context=None):
         cursor = data.get("cursor") or None
         path = _ensure_file(source)
         if (data.get("mode") or "").lower() == "people":
-            data["employees"] = _people_rows(path)
-            data["done"] = True; data["count"] = len(data["employees"])
-            data.pop("twin_error", None); return data
+            people = _people_rows(path)
+            data["tasks"] = people          # reply returns the tasks[] param → carries employees back
+            data["employees"] = people
+            data["cursor"] = {}; data["done"] = True; data["format"] = "people"
+            data["count"] = len(people); data.pop("twin_error", None); return data
         fmt = (cursor or {}).get("fmt") or AN.detect_format(path)
 
         if fmt == "1cd":
