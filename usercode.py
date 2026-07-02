@@ -133,6 +133,11 @@ def usercode(data, context=None):
     return data
 
 
+def handle(data):
+    """Corezoid GIT Call entrypoint (runner calls handle(data))."""
+    return usercode(data)
+
+
 # Local harness: drive the full cursor loop over a file and report parity + batch sizes.
 # `python3 usercode.py <file|url> [scope]`
 if __name__ == "__main__":
