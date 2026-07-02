@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""Corezoid GIT Call entrypoint (lang=python) — STATELESS PARSER / SEQUENCER.
+
+This node ONLY parses and sequences. It never calls Simulator. The Corezoid process
+is the executor + state machine: it takes the batch of typed tasks this node returns,
+creates/fills/links them in Simulator (api nodes), stores ref→id in its state process,
+then calls this node AGAIN with the returned cursor to get the next batch — looping
+until `done`, so the whole graph + accounts + links get built across many ≤30s steps.
+
+One call == one bounded window (≤ ~1.4 MB serialized OR ≤ ~25 s, whichever first),
+so it always fits inside the GIT Call 30 s budget and never returns more than ~1 MB.
+
+Tasks come out in strict dependency order (so an executor can apply them as-is):
+  create_form → create_actor → fill_actor → create_account/transfer → create_link
+For .1CD this is the extractor's staged cursor; for EnterpriseData XML and structure
+containers (.cf/.dt) the (small) task set is ordered and returned in a single window.
+
+Task `data` IN:
+  source_url (str)  http(s) link or a path the runner can read
+  scope      (str)  "full" (structure+data) | "structure" (forms only)   default "full"
+  cursor     (obj)  opaque resume token from the previous call; absent/null = start
+
+Task `data` OUT (added):
+  tasks   (list) the next batch of typed task objects  (≤ ~1 MB, dependency-ordered)
+  cursor  (obj)  pass this back verbatim on the next call
+  done    (bool) true ⇒ no more tasks; the executor stops looping and reconciles
+  format  (str)  detected artifact format (echoed for the executor/logs)
+  count   (int)  len(tasks) this batch
+  twin_error (str) present only on failure
+"""
+import os, sys, json, hashlib, tempfile, traceback
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import extractor as EX
+import analyze as AN
+import build_twin as BT   # op_stream_xml + fetch_to_temp (download/cache helper)
+
+STAGES = EX.STAGES
+N_STAGES = len(STAGES)
+# priority for non-staged formats (xml/cf/dt) — same dependency order the stages encode
+_PRIO = {"create_form": 0, "create_actor": 1, "fill_actor": 2,
+         "create_account": 3, "transfer": 4, "create_link": 5}
+
+
+def _ensure_file(source):
+    """Local path → as-is. http(s) URL → cache in /tmp keyed by URL hash (download only
+    when cold), so repeated cursor calls don't re-download the same artifact each step."""
+    if not str(source).startswith(("http://", "https://")):
+        return source
+    h = hashlib.sha1(source.encode("utf-8")).hexdigest()[:16]
+    base = os.path.basename(source.split("?", 1)[0]) or "src"
+    cached = os.path.join(tempfile.gettempdir(), "twinsrc_%s_%s" % (h, base))
+    if os.path.exists(cached) and os.path.getsize(cached) > 0:
+        return cached
+    tmp = BT.fetch_to_temp(source)          # streams the download to a temp file
+    try:
+        os.replace(tmp, cached); return cached
+    except Exception:
+        return tmp
+
+
+def _next_stage(si, scope):
+    """Advance si to the next stage that can yield under the current scope (skip None
+    stages and, in structure scope, every non-forms stage). Returns the stage index
+    (== N_STAGES when exhausted)."""
+    while si < N_STAGES:
+        name, fn = STAGES[si]
+        if fn is None:
+            si += 1; continue
+        if scope == "structure" and not name.startswith("forms"):
+            si += 1; continue
+        break
+    return si
+
+
+def _window_1cd(path, scope, cursor):
+    si = _next_stage((cursor or {}).get("si", 0), scope)
+    if si >= N_STAGES:
+        return [], {"fmt": "1cd", "si": si}, True
+    sc = (cursor or {}).get("sc")
+    out = EX.window(path, STAGES[si][0], sc)
+    if out["done"]:
+        nsi = _next_stage(si + 1, scope)
+        return out["tasks"], {"fmt": "1cd", "si": nsi, "sc": None}, (nsi >= N_STAGES)
+    return out["tasks"], {"fmt": "1cd", "si": si, "sc": out["next_cursor"]}, False
+
+
+def _window_oneshot(path, fmt, scope, rep):
+    """xml / cf / dt: produce the whole (small) ordered task set in a single window."""
+    if fmt.startswith("xml"):
+        raw = [op for (_s, op) in BT.op_stream_xml(path)]
+    else:  # cf / dt — structure only
+        raw = [{"op": "create_form", "ref": e["key"], "title": e["name"],
+                "color": "#868e96", "fields": []} for e in rep["entities"]]
+    if scope == "structure":
+        raw = [op for op in raw if op.get("op") == "create_form"]
+    raw.sort(key=lambda o: _PRIO.get(o.get("op"), 9))
+    return raw
+
+
+def usercode(data, context=None):
+    try:
+        source = data.get("source_url") or data.get("source")
+        if not source:
+            data["twin_error"] = "missing source_url"; data["done"] = True; return data
+        scope = (data.get("scope") or "full").lower()
+        if scope not in ("full", "structure"):
+            scope = "full"
+        cursor = data.get("cursor") or None
+        path = _ensure_file(source)
+        fmt = (cursor or {}).get("fmt") or AN.detect_format(path)
+
+        if fmt == "1cd":
+            tasks, next_cursor, done = _window_1cd(path, scope, cursor)
+        else:
+            if cursor and cursor.get("done"):
+                tasks, next_cursor, done = [], cursor, True
+            else:
+                rep = AN.analyze(path) if not fmt.startswith("xml") else {"entities": []}
+                tasks = _window_oneshot(path, fmt, scope, rep)
+                next_cursor, done = {"fmt": fmt, "done": True}, True
+
+        data["tasks"] = tasks
+        data["cursor"] = next_cursor
+        data["done"] = bool(done)
+        data["format"] = fmt
+        data["count"] = len(tasks)
+        data.pop("twin_error", None)
+    except Exception as e:
+        data["twin_error"] = "%s: %s" % (type(e).__name__, str(e)[:300])
+        data["twin_trace"] = traceback.format_exc()[-1200:]
+        data["tasks"] = []; data["done"] = True
+    return data
+
+
+# Local harness: drive the full cursor loop over a file and report parity + batch sizes.
+# `python3 usercode.py <file|url> [scope]`
+if __name__ == "__main__":
+    src = sys.argv[1] if len(sys.argv) > 1 else "../1c-demo/8-3-8_8K.1CD"
+    scope = sys.argv[2] if len(sys.argv) > 2 else "full"
+    d = {"source_url": src, "scope": scope}
+    import collections
+    totals = collections.Counter(); steps = 0; maxb = 0; first_order = []
+    while True:
+        d = usercode({"source_url": src, "scope": scope, "cursor": d.get("cursor")})
+        if d.get("twin_error"):
+            print("ERROR:", d["twin_error"]); print(d.get("twin_trace", "")); break
+        steps += 1
+        b = len(json.dumps(d["tasks"], ensure_ascii=False)); maxb = max(maxb, b)
+        for t in d["tasks"]:
+            totals[t["op"]] += 1
+            if len(first_order) < 12: first_order.append(t["op"])
+        if d["done"]:
+            break
+        if steps > 100000:
+            print("loop guard"); break
+    print(json.dumps({"format": d.get("format"), "steps": steps,
+                      "max_batch_bytes": maxb, "totals": dict(totals),
+                      "first_ops": first_order}, ensure_ascii=False, indent=2))
