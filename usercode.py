@@ -137,6 +137,47 @@ def _people_rows(path):
     return out
 
 
+def _isnum(v):
+    try:
+        float(v); return str(v) not in ("None", "")
+    except (TypeError, ValueError):
+        return False
+
+
+def _document_rows(path, limit_docs=3):
+    """Extract 1C documents WITH their line items (декомпозиция): each document → {number, date, lines:[{lineno, amount}]}.
+    Pairs a document header table (_DocumentNN) with its tabular-section (_DocumentNN_VT*), so each line becomes a
+    separate posting (not one aggregate total). `amount` = the line's sum column (max numeric field: qty*price=sum)."""
+    ex = EX.TwinExtractor(path)
+    objs = list(ex.objects())
+    # tabular-section table (has lines): phys like _DocumentNN_VT*
+    vt = next((o for o in objs if "_VT" in str(o.get("phys") or "") and any(
+        k in (o.get("title") or "").lower() for k in ("накладн", "документ", "заказ", "приход", "расход", "оплат"))), None)
+    if not vt:
+        return []
+    title = (vt.get("title") or "Документ").split(" — ")[0].split(" —")[0]
+    docs = {}
+    for row in ex.tables[vt["phys"]]:
+        try:
+            d = row.as_dict()
+        except Exception:
+            continue
+        lineno = ""
+        for k, v in d.items():
+            if "lineno" in str(k).lower():
+                lineno = str(v)
+        nums = [float(v) for k, v in d.items() if _isnum(v) and "lineno" not in str(k).lower()]
+        if not nums:
+            continue
+        amount = max(nums)                       # line sum column
+        docs.setdefault("000000001", []).append({"lineno": lineno or str(len(docs.get("000000001", [])) + 1), "amount": amount})
+    out = []
+    for num, lines in list(docs.items())[:limit_docs]:
+        out.append({"doc_type": title, "number": num, "lines": lines,
+                    "total": round(sum(l["amount"] for l in lines), 2)})
+    return out
+
+
 def usercode(data, context=None):
     try:
         source = data.get("source_url") or data.get("source")
@@ -163,6 +204,12 @@ def usercode(data, context=None):
             data["metrics"] = metrics
             data["cursor"] = {}; data["done"] = True; data["format"] = "analyze"
             data["count"] = 1; data.pop("twin_error", None); return data
+        if (data.get("mode") or "").lower() == "documents":
+            docs = _document_rows(path)
+            data["tasks"] = docs           # reply carries documents+lines via the tasks[] param
+            data["documents"] = docs
+            data["cursor"] = {}; data["done"] = True; data["format"] = "documents"
+            data["count"] = len(docs); data.pop("twin_error", None); return data
         fmt = (cursor or {}).get("fmt") or AN.detect_format(path)
 
         if fmt == "1cd":
