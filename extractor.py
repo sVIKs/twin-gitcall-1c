@@ -470,11 +470,21 @@ def _iter_rows(ex, cursor, push, budget, make):
         i += 1; r0 = 0
     return {"obj": i, "row": 0}, True
 
+def _row_std(ex, o, d):
+    """v2: семантические стандартные поля строки — для маппинга на канонические DTO-формы
+    (их item_N не совпадают с парсерскими colmap item_N)."""
+    std = {}
+    for col, key in (("_CODE", "code"), ("_DESCRIPTION", "name"), ("_NUMBER", "number"),
+                     ("_DATE_TIME", "date"), ("_POSTED", "posted")):
+        v = ex._val(d.get(col)) if col in d else None
+        if v not in (None, ""): std[key] = v
+    return std
+
 def stage_actor_shells(ex, cursor, push, budget):
     return _iter_rows(ex, cursor, push, budget,
         lambda o, d, ri: {"op": "create_actor", "ref": ex.row_ref(o, d, ri),
                           "form_ref": o["ref_form"], "title": ex.row_title(o, d, ri),
-                          "cls": o["cls"]})
+                          "cls": o["cls"], "std": _row_std(ex, o, d)})
 
 def stage_actor_data(ex, cursor, push, budget):
     def mk(o, d, ri):
@@ -482,7 +492,22 @@ def stage_actor_data(ex, cursor, push, budget):
         for col, key in o["colmap"].items():
             v = ex._val(d.get(col))
             if v not in (None, ""): data[key] = v
-        return {"op": "fill_actor", "ref": ex.row_ref(o, d, ri), "form_ref": o["ref_form"], "data": data} if data else None
+        if not data: return None
+        t = {"op": "fill_actor", "ref": ex.row_ref(o, d, ri), "form_ref": o["ref_form"],
+             "data": data, "cls": o["cls"], "std": _row_std(ex, o, d)}
+        if o["cls"] == "employees":     # v2: посада/оклад — для тройки персона↔посада
+            pos = sal = None
+            for col in d:
+                nm = (ex.fld_name(col) or "").lower()
+                v = ex._val(d.get(col))
+                if v in (None, ""): continue
+                if pos is None and re.search(r"должност|посад|position|role", nm): pos = str(v)
+                if sal is None and re.search(r"оклад|зарплат|salary|оплат", nm):
+                    try: sal = float(v)
+                    except (TypeError, ValueError): pass
+            t["position"] = pos or "Співробітник"
+            if sal: t["salary"] = sal
+        return t
     return _iter_rows(ex, cursor, push, budget, mk)
 
 def stage_links(ex, cursor, push, budget):
