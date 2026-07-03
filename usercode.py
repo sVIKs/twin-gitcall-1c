@@ -187,6 +187,9 @@ def usercode(data, context=None):
         if scope not in ("full", "structure"):
             scope = "full"
         cursor = data.get("cursor") or None
+        if isinstance(cursor, str):                     # v2: rpc передаёт cursor JSON-строкой
+            try: cursor = json.loads(cursor) if cursor.strip() else None
+            except ValueError: cursor = None
         path = _ensure_file(source)
         if (data.get("mode") or "").lower() == "people":
             people = _people_rows(path)
