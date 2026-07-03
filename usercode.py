@@ -219,11 +219,19 @@ def usercode(data, context=None):
             try:
                 agg = ex.aggregate_accounts()
                 meta = ex.ref_meta()          # v2: cls/form_ref для резолва формы в reconcile
+                sc_raw = data.get("scope_classes")
+                if isinstance(sc_raw, str):
+                    scope_set = set(x.strip() for x in sc_raw.split(",") if x.strip()) or None
+                elif isinstance(sc_raw, (list, tuple, set)):
+                    scope_set = set(sc_raw) or None
+                else:
+                    scope_set = None
                 base = [{"ref": k[0], "name": k[1],
                          "amount": round(v["amount"], 4), "currency": v["currency"],
                          "cls": meta.get(k[0], ("", ""))[0],
                          "form_ref": meta.get(k[0], ("", ""))[1]}
-                        for k, v in sorted(agg.items())][:5000]
+                        for k, v in sorted(agg.items())
+                        if scope_set is None or meta.get(k[0], ("", ""))[0] in scope_set][:5000]
             finally:
                 ex.close()
             data["tasks"] = base
