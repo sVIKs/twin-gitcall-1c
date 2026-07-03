@@ -271,7 +271,14 @@ def usercode(data, context=None):
 
 def handle(data):
     """Corezoid GIT Call entrypoint (runner calls handle(data))."""
-    return usercode(data)
+    out = usercode(data)
+    # reply-узел процесса отдаёт planned/metrics/count во ВСЕХ режимах — валидация
+    # res_data_type падает на отсутствующем object → всегда даём дефолты.
+    if not isinstance(out.get("planned"), dict): out["planned"] = {}
+    if not isinstance(out.get("metrics"), dict): out["metrics"] = {}
+    out.setdefault("count", 0)
+    out.setdefault("twin_error", "")
+    return out
 
 
 # Local harness: drive the full cursor loop over a file and report parity + batch sizes.
