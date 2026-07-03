@@ -73,12 +73,12 @@ def _next_stage(si, scope):
     return si
 
 
-def _window_1cd(path, scope, cursor):
+def _window_1cd(path, scope, cursor, classes=None):
     si = _next_stage((cursor or {}).get("si", 0), scope)
     if si >= N_STAGES:
         return [], {"fmt": "1cd", "si": si}, True
     sc = (cursor or {}).get("sc")
-    out = EX.window(path, STAGES[si][0], sc)
+    out = EX.window(path, STAGES[si][0], sc, classes=classes)
     if out["done"]:
         nsi = _next_stage(si + 1, scope)
         return out["tasks"], {"fmt": "1cd", "si": nsi, "sc": None}, (nsi >= N_STAGES)
@@ -200,10 +200,30 @@ def usercode(data, context=None):
             metrics = {"entities": int(m.get("entities", 0) or 0), "records": int(m.get("records", 0) or 0),
                        "links": int(m.get("links", 0) or 0), "registers": int(m.get("registers", 0) or 0),
                        "fields": int(m.get("fields", 0) or 0), "fmt": rep.get("format", "")}
+            planned = {}
+            if AN.detect_format(path) == "1cd":     # v2: per-class planned counts (scope-UI + STRUCT-гейт)
+                ex = EX.TwinExtractor(path)
+                try: planned = ex.class_counts()
+                finally: ex.close()
             data["tasks"] = [metrics]       # reply carries it via the tasks[] param
             data["metrics"] = metrics
+            data["planned"] = planned
             data["cursor"] = {}; data["done"] = True; data["format"] = "analyze"
             data["count"] = 1; data.pop("twin_error", None); return data
+        if (data.get("mode") or "").lower() == "baseline":
+            # v2: эталон для reconcile — агрегаты регистров per (актор, счёт) на стороне ФАЙЛА
+            ex = EX.TwinExtractor(path)
+            try:
+                agg = ex.aggregate_accounts()
+                base = [{"ref": k[0], "name": k[1],
+                         "amount": round(v["amount"], 4), "currency": v["currency"]}
+                        for k, v in sorted(agg.items())][:5000]
+            finally:
+                ex.close()
+            data["tasks"] = base
+            data["baseline"] = base
+            data["cursor"] = {}; data["done"] = True; data["format"] = "baseline"
+            data["count"] = len(base); data.pop("twin_error", None); return data
         if (data.get("mode") or "").lower() == "documents":
             docs = _document_rows(path)
             data["tasks"] = docs           # reply carries documents+lines via the tasks[] param
@@ -211,9 +231,17 @@ def usercode(data, context=None):
             data["cursor"] = {}; data["done"] = True; data["format"] = "documents"
             data["count"] = len(docs); data.pop("twin_error", None); return data
         fmt = (cursor or {}).get("fmt") or AN.detect_format(path)
+        # v2: scope_classes — выбор пользователем структур для переноса (список/CSV)
+        sc_raw = data.get("scope_classes")
+        if isinstance(sc_raw, str):
+            classes = set(x.strip() for x in sc_raw.split(",") if x.strip()) or None
+        elif isinstance(sc_raw, (list, tuple)):
+            classes = set(sc_raw) or None
+        else:
+            classes = None
 
         if fmt == "1cd":
-            tasks, next_cursor, done = _window_1cd(path, scope, cursor)
+            tasks, next_cursor, done = _window_1cd(path, scope, cursor, classes=classes)
         else:
             if cursor and cursor.get("done"):
                 tasks, next_cursor, done = [], cursor, True
