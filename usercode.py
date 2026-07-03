@@ -132,6 +132,16 @@ def usercode(data, context=None):
             data["employees"] = people
             data["cursor"] = {}; data["done"] = True; data["format"] = "people"
             data["count"] = len(people); data.pop("twin_error", None); return data
+        if (data.get("mode") or "").lower() == "analyze":
+            rep = AN.analyze(path)
+            m = (rep.get("metrics") or {})
+            metrics = {"entities": int(m.get("entities", 0) or 0), "records": int(m.get("records", 0) or 0),
+                       "links": int(m.get("links", 0) or 0), "registers": int(m.get("registers", 0) or 0),
+                       "fields": int(m.get("fields", 0) or 0), "fmt": rep.get("format", "")}
+            data["tasks"] = [metrics]       # reply carries it via the tasks[] param
+            data["metrics"] = metrics
+            data["cursor"] = {}; data["done"] = True; data["format"] = "analyze"
+            data["count"] = 1; data.pop("twin_error", None); return data
         fmt = (cursor or {}).get("fmt") or AN.detect_format(path)
 
         if fmt == "1cd":
