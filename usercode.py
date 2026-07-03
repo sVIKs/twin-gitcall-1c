@@ -98,9 +98,23 @@ def _window_oneshot(path, fmt, scope, rep):
     return raw
 
 
+def _find_field(d, keys):
+    """Return the first non-empty value of any column whose name contains one of `keys`."""
+    for k, v in d.items():
+        kl = str(k).lower()
+        if any(t in kl for t in keys):
+            s = str(v).strip()
+            if s and s not in ("None", "b''"):
+                return s
+    return ""
+
+
 def _people_rows(path):
-    """Extract real employees (ФИО + code) from the 1C «Сотрудники» catalog rows.
-    Universal: matches any catalog whose title looks like employees/staff/persons."""
+    """Extract real employees from the 1C «Сотрудники» catalog: {code, fio, position, salary}.
+    Universal: matches any employees/staff/persons catalog. `position`/`salary` are pulled from
+    columns whose names hint at a role/оклад when the schema carries them; minimal bases (only
+    name+code, like this demo) fall back to a generic «Співробітник» position and salary 0 — so the
+    same contract works on richer bases where СотрудникиОрганизаций.Должность / начисления exist."""
     ex = EX.TwinExtractor(path)
     out = []
     for o in ex.objects():
@@ -110,8 +124,15 @@ def _people_rows(path):
                 d = row.as_dict() if hasattr(row, "as_dict") else {}
                 fio = (d.get("_DESCRIPTION") or d.get("_Description") or "").strip()
                 code = (d.get("_CODE") or d.get("_Code") or "").strip()
-                if fio:
-                    out.append({"code": code, "fio": fio})
+                if not fio:
+                    continue
+                position = _find_field(d, ("должност", "posad", "position", "role")) or "Співробітник"
+                salary_s = _find_field(d, ("оклад", "зарплат", "salary", "оплат"))
+                try:
+                    salary = int(float(salary_s)) if salary_s else 0
+                except ValueError:
+                    salary = 0
+                out.append({"code": code, "fio": fio, "position": position, "salary": salary})
             break
     return out
 
