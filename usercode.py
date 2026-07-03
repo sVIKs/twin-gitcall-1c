@@ -218,8 +218,11 @@ def usercode(data, context=None):
             ex = EX.TwinExtractor(path)
             try:
                 agg = ex.aggregate_accounts()
+                meta = ex.ref_meta()          # v2: cls/form_ref для резолва формы в reconcile
                 base = [{"ref": k[0], "name": k[1],
-                         "amount": round(v["amount"], 4), "currency": v["currency"]}
+                         "amount": round(v["amount"], 4), "currency": v["currency"],
+                         "cls": meta.get(k[0], ("", ""))[0],
+                         "form_ref": meta.get(k[0], ("", ""))[1]}
                         for k, v in sorted(agg.items())][:5000]
             finally:
                 ex.close()

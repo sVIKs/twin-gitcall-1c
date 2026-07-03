@@ -426,15 +426,25 @@ class TwinExtractor:
         ОТДЕЛЬНОМ ридере файла, чтобы основной остался свежим для emit-прохода."""
         if self._idrref_map is not None: return self._idrref_map
         m = {}
+        meta = {}
         with open(self.path, "rb") as f2:
             db2 = onec_dtools.DatabaseReader(f2)
             for obj in self.objects():
                 for r in db2.tables[obj["phys"]]:
                     d = r.as_dict(); idr = d.get("_IDRREF")
                     if isinstance(idr, (bytes, bytearray)) and idr != _ZERO16:
-                        m[idr.hex()] = self.row_ref(obj, d)
+                        ref = self.row_ref(obj, d)
+                        m[idr.hex()] = ref
+                        meta[ref] = (obj["cls"], obj["ref_form"])
         self._idrref_map = m
+        self._ref_meta = meta
         return m
+
+    def ref_meta(self):
+        """v2: ref → (cls, ref_form) для reconcile (резолв формы актора по baseline-ref)."""
+        if getattr(self, "_ref_meta", None) is None:
+            self.idrref_map()
+        return self._ref_meta
 
 
 # ─────────────────────────── СТАДИИ (оконный курсор) ───────────────────────────
