@@ -244,7 +244,11 @@ class TwinExtractor:
         with open(self.path, "rb") as f2:
             db2 = onec_dtools.DatabaseReader(f2)
             for o in self.objects():
-                try: n = len(list(db2.tables[o["phys"]]))
+                # рахуємо ЛИШЕ валідні рядки (row_valid) — «Заплановано» = те,
+                # що build реально створить (інакше план завищено порожніми записами)
+                try:
+                    n = sum(1 for row in db2.tables[o["phys"]]
+                            if self.row_valid(o, row.as_dict()))
                 except Exception: n = 0
                 planned[o["cls"]] = planned.get(o["cls"], 0) + n
             lines = 0
@@ -252,6 +256,14 @@ class TwinExtractor:
                 try: lines += len(list(db2.tables[vt["phys"]]))
                 except Exception: pass
             if lines: planned["doclines"] = lines
+        # службові контр-актори контурів (двійний запис) — теж створювані обʼєкти:
+        # «Заплановано» має збігатися зі «Створено» один в один
+        idx = self.idrref_map()
+        ctr = sum(1 for reg in self.registers()
+                  if reg["resources"] and self.reg_primary_form(reg, idx))
+        if planned.get("doclines"):
+            ctr += 1        # ctrdoc — контур проводок документів (doc_line_txns)
+        if ctr: planned["counters"] = ctr
         return planned
 
     def objects(self):
