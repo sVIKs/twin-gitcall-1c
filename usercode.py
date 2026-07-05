@@ -28,7 +28,7 @@ Task `data` OUT (added):
   count   (int)  len(tasks) this batch
   twin_error (str) present only on failure
 """
-import os, sys, json, hashlib, tempfile, traceback
+import os, sys, json, hashlib, tempfile, time, traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import extractor as EX
@@ -240,6 +240,25 @@ def usercode(data, context=None):
                 if src.startswith(("http://", "https://")):
                     fm["host"] = src.split("/")[2]
                 fm.update(_DL_STATS)
+                # экономіка: сума окладів і сума документів — для роллапа ECONOMICS
+                try:
+                    fm["salary_total"] = round(sum(float(p.get("salary") or 0)
+                                                   for p in _people_rows(path)), 2)
+                except Exception:
+                    fm["salary_total"] = 0
+                try:
+                    if AN.detect_format(path) == "1cd":
+                        ex2 = EX.TwinExtractor(path)
+                        try:
+                            agg = ex2.aggregate_accounts()
+                            vals = agg.values() if isinstance(agg, dict) else agg
+                            fm["money_total"] = round(sum(abs(float(a.get("amount") or 0))
+                                for a in vals if str(a.get("currency") or "").lower()
+                                in ("money", "грн", "деньги")), 2)
+                        finally:
+                            ex2.close()
+                except Exception:
+                    fm["money_total"] = 0
             except Exception as e:
                 fm["meta_error"] = str(e)[:120]
             data["tasks"] = [metrics]       # reply carries it via the tasks[] param
