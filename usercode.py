@@ -42,6 +42,8 @@ _PRIO = {"create_form": 0, "create_actor": 1, "fill_actor": 2,
          "create_account": 3, "transfer": 4, "create_link": 5}
 
 
+_DL_STATS = {}
+
 def _ensure_file(source):
     """Local path → as-is. http(s) URL → cache in /tmp keyed by URL hash (download only
     when cold), so repeated cursor calls don't re-download the same artifact each step."""
@@ -52,7 +54,17 @@ def _ensure_file(source):
     cached = os.path.join(tempfile.gettempdir(), "twinsrc_%s_%s" % (h, base))
     if os.path.exists(cached) and os.path.getsize(cached) > 0:
         return cached
+    t0 = time.time()
     tmp = BT.fetch_to_temp(source)          # streams the download to a temp file
+    dl_ms = int((time.time() - t0) * 1000)
+    try:
+        sz = os.path.getsize(tmp)
+    except Exception:
+        sz = 0
+    # слепок замера — analyze положит его в file_meta (скорость по холодному скачиванию)
+    global _DL_STATS
+    _DL_STATS = {"dl_ms": dl_ms, "bytes": sz,
+                 "kbps": round(sz / 1024.0 / max(dl_ms / 1000.0, 0.001), 1) if sz else 0}
     try:
         os.replace(tmp, cached); return cached
     except Exception:
@@ -208,9 +220,32 @@ def usercode(data, context=None):
                 ex = EX.TwinExtractor(path)
                 try: planned = ex.class_counts()
                 finally: ex.close()
+            # v3: універсальний паспорт файлу — все, що можна зняти детерміновано
+            fm = {"bytes": 0, "sha256": "", "mime": "", "rows": 0, "host": "",
+                  "parser": "twin-parser v3 (onec_dtools)", "av": "не перевірявся (ізольований раннер)"}
+            try:
+                fm["bytes"] = os.path.getsize(path)
+                hsh = hashlib.sha256()
+                with open(path, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                        hsh.update(chunk)
+                fm["sha256"] = hsh.hexdigest()
+                ext = os.path.splitext(str(data.get("source_url") or path).split("?")[0])[1].lower()
+                fm["mime"] = {".1cd": "application/x-1c-database", ".dt": "application/x-1c-dump",
+                              ".cf": "application/x-1c-config", ".xlsx":
+                              "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                              ".csv": "text/csv", ".xml": "text/xml"}.get(ext, "application/octet-stream")
+                fm["rows"] = sum(v for k, v in planned.items() if k != "counters")
+                src = str(data.get("source_url") or "")
+                if src.startswith(("http://", "https://")):
+                    fm["host"] = src.split("/")[2]
+                fm.update(_DL_STATS)
+            except Exception as e:
+                fm["meta_error"] = str(e)[:120]
             data["tasks"] = [metrics]       # reply carries it via the tasks[] param
             data["metrics"] = metrics
             data["planned"] = planned
+            data["file_meta"] = fm
             data["cursor"] = {}; data["done"] = True; data["format"] = "analyze"
             data["count"] = 1; data.pop("twin_error", None); return data
         if (data.get("mode") or "").lower() == "baseline":
