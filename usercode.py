@@ -319,8 +319,13 @@ def handle(data):
     # res_data_type падает на отсутствующем object → всегда даём дефолты.
     if not isinstance(out.get("planned"), dict): out["planned"] = {}
     if not isinstance(out.get("metrics"), dict): out["metrics"] = {}
+    if not isinstance(out.get("file_meta"), dict): out["file_meta"] = {}
+    if not isinstance(out.get("tasks"), list): out["tasks"] = []
+    if not isinstance(out.get("cursor"), dict): out["cursor"] = {}
     out.setdefault("count", 0)
     out.setdefault("twin_error", "")
+    out.setdefault("format", "")
+    out.setdefault("done", True)
     return out
 
 
