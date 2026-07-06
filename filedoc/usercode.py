@@ -191,11 +191,23 @@ def handle(data, context=None):
             except Exception:
                 pass
     out["ms"] = int((time.time() - t0) * 1000)
+    # keep the git_call reply small: drop the echoed base64 payload
+    for k in ("file_b64", "content_b64", "base64"):
+        if k in data:
+            try:
+                del data[k]
+            except Exception:
+                data[k] = ""
     data["filedoc"] = out
     data["doc_text"] = out["text"]
     data["file_name_out"] = out["file_name"]
     data["found"] = out["found"]
     data["twin_error"] = out["twin_error"]
+    # top-level diagnostics (visible without digging into filedoc.*)
+    data["fd_format"] = out["format"]
+    data["fd_kb"] = out["kb"]
+    data["fd_nchars"] = out["n_chars"]
+    data["fd_lib"] = out["lib_status"]
     return data
 
 
