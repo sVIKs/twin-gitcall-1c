@@ -73,8 +73,13 @@ def _materialize(data):
     b64 = data.get("file_b64") or data.get("content_b64") or data.get("base64")
     if b64:
         s = b64
-        if isinstance(s, str) and s.startswith("data:") and "," in s:
+        if isinstance(s, (bytes, bytearray)):
+            s = s.decode("ascii", "ignore")
+        if s.startswith("data:") and "," in s:
             s = s.split(",", 1)[1]
+        # Corezoid may inject whitespace/newlines or drop padding in large fields:
+        s = "".join(s.split())
+        s += "=" * (-len(s) % 4)
         raw = base64.b64decode(s)
         suffix = "_" + (name or "file")
         fd, tmp = tempfile.mkstemp(suffix=suffix)
