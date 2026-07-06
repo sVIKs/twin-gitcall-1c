@@ -514,7 +514,9 @@ def stage_actor_data(ex, cursor, push, budget):
         for col, key in o["colmap"].items():
             v = ex._val(d.get(col))
             if v not in (None, ""): data[key] = v
-        if not data: return None
+        # employees: НЕ отсекаем пустой data — position (дефолт «Співробітник»)
+        # обязан дойти до builder, инакше тройка персона↔посада будет не у всех
+        if not data and o["cls"] != "employees": return None
         t = {"op": "fill_actor", "ref": ex.row_ref(o, d, ri), "form_ref": o["ref_form"],
              "data": data, "cls": o["cls"], "std": _row_std(ex, o, d)}
         if o["cls"] == "employees":     # v2: посада/оклад — для тройки персона↔посада
