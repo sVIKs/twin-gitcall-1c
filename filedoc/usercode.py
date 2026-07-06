@@ -70,9 +70,13 @@ def _detect(path, name):
 def _materialize(data):
     """Return (local_path, source_name) from file_b64 or source_url."""
     name = data.get("file_name") or data.get("fileName") or ""
-    b64 = data.get("file_b64") or data.get("content_b64") or data.get("base64")
+    b64 = (data.get("file_b64") or data.get("content_b64") or data.get("base64")
+           or data.get("file_b64_parts"))
     if b64:
         s = b64
+        # Corezoid caps a single git_call data field (~7KB): accept a list of chunks
+        if isinstance(s, (list, tuple)):
+            s = "".join(str(x) for x in s)
         if isinstance(s, (bytes, bytearray)):
             s = s.decode("ascii", "ignore")
         if s.startswith("data:") and "," in s:
