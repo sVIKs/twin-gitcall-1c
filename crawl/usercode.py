@@ -72,6 +72,50 @@ PHONE_RE  = re.compile(r"(?<!\w)(\+?\d[\d\-\s().]{7,17}\d)(?!\w)")
 EMAIL_RE  = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 SOCIAL_RE = re.compile(r"https?://(?:www\.)?(?:facebook|instagram|linkedin|twitter|x|youtube|t|telegram|tiktok)\.(?:com|me)/[^\s\"'<>]+", re.I)
 
+# ---- IGNORE-LIST (C2 discover): paths we KNOW are not business sections -------------
+# substrings matched against the lowercased URL path; a hit drops the link + records reason.
+IGNORE_SUBSTR = (
+    "/login", "/signin", "/sign-in", "/log-in", "/logout", "/signout",
+    "/register", "/signup", "/sign-up", "/auth",
+    "/cart", "/basket", "/checkout", "/order", "/payment", "/pay",
+    "/privacy", "/cookie", "/terms", "/policy", "/policies", "/legal", "/gdpr", "/agreement",
+    "/search", "/sitemap", "/404", "/500", "/error",
+    "/rss", "/feed", "/print", "/share", "/wp-admin", "/wp-login", "/admin",
+)
+# social redirects / share links (internal or external) — not business sections.
+IGNORE_SOCIAL_RE = re.compile(
+    r"(facebook|instagram|linkedin|twitter|youtube|youtu\.be|t\.me|telegram|tiktok|viber|whatsapp|pinterest)",
+    re.I)
+# non-page assets that occasionally appear as <a href> — never a "section".
+IGNORE_EXT_RE = re.compile(
+    r"\.(?:pdf|jpe?g|png|gif|svg|webp|ico|zip|rar|7z|docx?|xlsx?|pptx?|csv|mp4|mp3|avi|mov|apk|exe|dmg)(?:\?|#|$)",
+    re.I)
+
+
+def _ignore_reason(u):
+    """Return a short reason string if URL must be ignored for discover, else None."""
+    p = urlparse(u)
+    path = (p.path or "/").lower()
+    for s in IGNORE_SUBSTR:
+        if s in path:
+            return s.strip("/") or "root"
+    if IGNORE_SOCIAL_RE.search(u):
+        return "social"
+    if IGNORE_EXT_RE.search(path):
+        return "file"
+    return None
+
+
+def _section_key(u):
+    """First path segment = the 'section' a URL belongs to; '/' -> home."""
+    seg = [s for s in (urlparse(u).path or "").split("/") if s]
+    return seg[0].lower() if seg else "home"
+
+
+def _section_label(sec):
+    """Human-ish section label for the progress line (kept short, source language-agnostic)."""
+    return "головна" if sec == "home" else sec.replace("-", " ").replace("_", " ")
+
 
 def _norm_url(u):
     """Canonical URL for dedup: drop fragment, lowercase scheme+host, strip trailing slash."""
@@ -420,13 +464,121 @@ def _assemble(web_ok, domain, base_lang, pages, entities, ph, em, so,
     }
 
 
+# ======================================================================================
+# C2. discover(url) — estimate volume + honest denominator N (base sections after ignore)
+# ======================================================================================
+def _discover(seed, max_sections=HARD_CAP):
+    t0 = time.time()
+    max_sections = max(1, min(HARD_CAP, int(max_sections or HARD_CAP)))
+    seed = _norm_url(seed)
+    scope_domain = _reg_domain(urlparse(seed).netloc)
+    status, ctype, html, nbytes, ms, err = _fetch(seed)
+    if err or not html:
+        return {"mode": "discover", "web_ok": False, "domain": scope_domain,
+                "pages_total": 0, "page_urls": [], "sections": [], "ignored": [],
+                "base_lang": None, "title": "",
+                "errors": ["homepage %s -> %s" % (seed, err or "empty")],
+                "lib_status": LIB, "budget": {"elapsed_s": round(time.time() - t0, 2)}}
+
+    base_lang = None
+    m = re.search(r'<html[^>]*\blang=["\']?([a-zA-Z]{2})', html)
+    if m:
+        base_lang = m.group(1).lower()
+
+    # all same-domain, one-language, canonical links from the homepage (+ sitemap)
+    links = list(_links(seed, html, scope_domain, base_lang))
+    for u in _sitemap_urls(seed, scope_domain, base_lang):
+        if u not in links:
+            links.append(u)
+    links = sorted(set(links))
+
+    kept, ignored = [], []
+    for u in links:
+        reason = _ignore_reason(u)
+        if reason:
+            ignored.append({"url": u, "reason": reason})
+        else:
+            kept.append(u)
+
+    # collapse KEPT links to BASE SECTIONS: one shallowest representative per first-segment.
+    # homepage itself is always section #0 (richest structured data lives there).
+    by_section = OrderedDict()
+    by_section["home"] = seed
+    for u in kept:
+        sec = _section_key(u)
+        if sec == "home":
+            continue
+        cur = by_section.get(sec)
+        if cur is None or (len(urlparse(u).path) < len(urlparse(cur).path)):
+            by_section[sec] = u
+
+    sections = list(by_section.keys())[:max_sections]
+    page_urls = [by_section[s] for s in sections]
+    section_labels = [_section_label(s) for s in sections]
+
+    return {
+        "mode": "discover", "web_ok": True, "domain": scope_domain,
+        "base_lang": base_lang, "title": _title(html),
+        "pages_total": len(page_urls),          # <- HONEST progress DENOMINATOR
+        "page_urls": page_urls,                  # aligned with sections/labels
+        "sections": section_labels,
+        "ignored": ignored,                      # {url, reason} — what the ignore-list removed
+        "links_seen": len(links),
+        "errors": [],
+        "lib_status": LIB,
+        "budget": {"elapsed_s": round(time.time() - t0, 2)},
+    }
+
+
+# ======================================================================================
+# C2. page(url) — one page: clean text (<=40 KB) + structured entities + same-domain links
+# ======================================================================================
+def _page(url):
+    t0 = time.time()
+    url = _norm_url(url)
+    scope_domain = _reg_domain(urlparse(url).netloc)
+    status, ctype, html, nbytes, ms, err = _fetch(url)
+    if err or not html:
+        return {"mode": "page", "web_ok": False, "url": url, "title": "",
+                "text": "", "structured_entities": [], "links": [],
+                "regex_hits": {"phones": [], "emails": [], "socials": []},
+                "errors": ["%s -> %s" % (url, err or "empty")],
+                "budget": {"elapsed_s": round(time.time() - t0, 2)}}
+    base_lang = None
+    m = re.search(r'<html[^>]*\blang=["\']?([a-zA-Z]{2})', html)
+    if m:
+        base_lang = m.group(1).lower()
+    txt = _clean_text(html)
+    ents = _entities_from_structured(url, html)
+    ph, em, so = _contacts(url, txt, html)
+    links = _links(url, html, scope_domain, base_lang)
+    return {
+        "mode": "page", "web_ok": True, "url": url, "title": _title(html),
+        "text": txt,                              # <=40 KB clean text (chunk_text for C1)
+        "structured_entities": ents,              # web-structured, conf 0.95 (two-source vs LLM)
+        "regex_hits": {"phones": ph, "emails": em, "socials": so},
+        "links": links,
+        "errors": [],
+        "budget": {"elapsed_s": round(time.time() - t0, 2),
+                   "bytes": nbytes, "fetch_ms": ms},
+    }
+
+
 def handle(data):
     try:
         url = data.get("url") or data.get("source_url") or ""
+        mode = (data.get("mode") or "").strip().lower()
         if not url:
             data["crawl"] = {"web_ok": False, "errors": ["no url"], "lib_status": LIB,
-                             "done": True, "cursor": None}
+                             "done": True, "cursor": None, "mode": mode or "crawl"}
             return data
+        if mode == "discover":                    # C2: volume estimate + honest N
+            data["crawl"] = _discover(url, data.get("maxSections") or HARD_CAP)
+            return data
+        if mode == "page":                        # C2: single page fetch+parse
+            data["crawl"] = _page(url)
+            return data
+        # default: full BFS crawl (unchanged behaviour, back-compatible)
         try:
             max_pages = int(data.get("maxPages") or 25)
         except Exception:
