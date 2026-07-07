@@ -26,6 +26,8 @@ Movement: по ПУБЛІЧНІЙ ссилці на застосунок (App St
             title, developer, rating (float|null), reviews_count (int|null),
             version (str|null), version_date (int YYYYMMDD|null), version_date_iso (str|null),
             installs (int|null), installs_text (str|null), price (str|null), genre (str|null),
+            size_bytes (int|null), size_text (str|null), content_rating (str|null),
+            languages (list[str]|null), languages_count (int|null),
             raw_snippets[str], errors[]
          } ], lib_status{}, budget{}, errors[]
        }
@@ -108,6 +110,40 @@ def _iso_to_yyyymmdd(s):
         return None, iso
 
 
+_MONTHS = {}
+for _i, _mn in enumerate(("jan", "feb", "mar", "apr", "may", "jun", "jul",
+                          "aug", "sep", "oct", "nov", "dec"), 1):
+    _MONTHS[_mn] = _i
+# Ukrainian short month stems (Play may localize despite hl=en on some IPs)
+for _uk, _i in (("січ", 1), ("лют", 2), ("бер", 3), ("квіт", 4), ("трав", 5),
+                ("черв", 6), ("лип", 7), ("серп", 8), ("вер", 9),
+                ("жовт", 10), ("лист", 11), ("груд", 12)):
+    _MONTHS[_uk] = _i
+
+
+def _monthname_to_yyyymmdd(s):
+    """'Jun 30, 2026' / '30 Jun 2026' / '30 черв. 2026' -> (20260630, '2026-06-30')."""
+    if not s:
+        return None, None
+    t = str(s).lower()
+    mm = re.search(r"([a-zA-Zа-яіїєґ]{3,})", t)
+    dd = re.search(r"\b(\d{1,2})\b", t)
+    yy = re.search(r"\b(\d{4})\b", t)
+    if not (mm and dd and yy):
+        return None, str(s)[:12]
+    stem = mm.group(1)[:4]
+    mon = _MONTHS.get(stem) or _MONTHS.get(stem[:3])
+    if not mon:
+        return None, str(s)[:12]
+    try:
+        d = int(dd.group(1)); y = int(yy.group(1))
+        if not (1 <= d <= 31 and 1990 <= y <= 2100):
+            return None, str(s)[:12]
+        return y * 10000 + mon * 100 + d, "%04d-%02d-%02d" % (y, mon, d)
+    except Exception:
+        return None, str(s)[:12]
+
+
 def _installs_to_int(txt):
     """'10,000,000+' -> 10000000 ; '1B+' -> 1000000000 ; None on failure."""
     if not txt:
@@ -135,12 +171,39 @@ def _installs_to_int(txt):
     return int(v) if v == int(v) else int(round(v))
 
 
+def _human_mb(size_bytes):
+    """Bytes -> human MB string e.g. 160731136 -> '153.3 MB'. None on failure."""
+    try:
+        mb = float(size_bytes) / (1024.0 * 1024.0)
+    except Exception:
+        return None
+    if mb >= 1024.0:
+        return "%.2f GB" % (mb / 1024.0)
+    return "%.1f MB" % mb
+
+
+def _size_to_bytes(num, unit):
+    """('45', 'MB') / ('1.2', 'GB') / ('512', 'КБ') -> int bytes. None on failure."""
+    try:
+        val = float(str(num).replace(" ", "").replace(" ", "").replace(",", "."))
+    except Exception:
+        return None
+    u = (unit or "").strip().upper()
+    mult = {"KB": 1024, "КБ": 1024, "MB": 1024 ** 2, "МБ": 1024 ** 2,
+            "GB": 1024 ** 3, "ГБ": 1024 ** 3}.get(u)
+    if not mult:
+        return None
+    return int(round(val * mult))
+
+
 def _new_app(platform, url):
     return {"platform": platform, "app_id": None, "country": None, "url": url,
             "found": False, "source": None, "sources_tried": [],
             "title": None, "developer": None, "rating": None, "reviews_count": None,
             "version": None, "version_date": None, "version_date_iso": None,
             "installs": None, "installs_text": None, "price": None, "genre": None,
+            "size_bytes": None, "size_text": None, "content_rating": None,
+            "languages": None, "languages_count": None,
             "raw_snippets": [], "errors": []}
 
 
@@ -193,6 +256,21 @@ def _probe_ios(url):
             price = r.get("formattedPrice")
             app["price"] = price if price else ("Free" if r.get("price") == 0 else None)
             app["genre"] = r.get("primaryGenreName")
+            # size (iTunes publishes fileSizeBytes as a string)
+            fsb = r.get("fileSizeBytes")
+            if fsb is not None:
+                try:
+                    app["size_bytes"] = int(fsb)
+                    app["size_text"] = _human_mb(app["size_bytes"])
+                except Exception:
+                    pass
+            # content / age rating
+            app["content_rating"] = r.get("contentAdvisoryRating") or r.get("trackContentRating")
+            # languages (ISO2A list)
+            langs = r.get("languageCodesISO2A")
+            if isinstance(langs, list):
+                app["languages"] = langs
+                app["languages_count"] = len(langs)
             app["found"] = app["rating"] is not None or app["reviews_count"] is not None or bool(app["version"])
             return app
     return app
@@ -286,6 +364,9 @@ def _probe_android(url):
         cat = node.get("applicationCategory") or node.get("genre")
         if cat and not app["genre"]:
             app["genre"] = cat if isinstance(cat, str) else None
+        cr = node.get("contentRating")
+        if cr and not app["content_rating"]:
+            app["content_rating"] = cr if isinstance(cr, str) else None
 
     # 2) regex fallbacks over raw HTML (Google renders much client-side -> often null)
     if app["rating"] is None:
@@ -297,9 +378,28 @@ def _probe_android(url):
                     app["rating"] = round(v, 2)
             except Exception:
                 pass
+    # reviews_count \u2014 extra regex over the ds blob near the rating (JSON-LD already tried)
+    if app["reviews_count"] is None:
+        for pat in (r'(\d[\d,\.\s]*[KMBkmb]?)\s*(?:reviews|reviewers|\u0432\u0456\u0434\u0433\u0443\u043a)',
+                    r'"ratingCount"\s*:\s*"?(\d[\d,\.]*)"?',
+                    r'\[\s*(\d{3,})\s*,\s*\[\d(?:\.\d+)?\]\]'):
+            m = re.search(pat, html, re.I)
+            if m:
+                rc = _installs_to_int(m.group(1)) if re.search(r'[KMBkmb]', m.group(1)) \
+                    else None
+                if rc is None:
+                    try:
+                        rc = int(re.sub(r"[^\d]", "", m.group(1)))
+                    except Exception:
+                        rc = None
+                if rc:
+                    app["reviews_count"] = rc
+                    break
     # installs
     if app["installs"] is None:
         m = re.search(r'>\s*([\d][\d,\.\s]*[KMBkmb]?\+)\s*</div>\s*<div[^>]*>\s*(?:Downloads|\u0417\u0430\u0432\u0430\u043d\u0442\u0430\u0436)', html)
+        if not m:
+            m = re.search(r'"(\d[\d.,]*[KMB]?\+?)"[^\]]*\bDownloads\b', html)
         if not m:
             m = re.search(r'([\d][\d,\. ]*[KMBkmb]?\+)\s*(?:downloads|Downloads)', html)
         if not m:
@@ -307,26 +407,67 @@ def _probe_android(url):
         if m:
             app["installs_text"] = m.group(1).strip()
             app["installs"] = _installs_to_int(app["installs_text"])
-    # version
+    # version \u2014 Play embeds it in the ds blob: [[["2.335.06"]],[[[35 (verName then verCode)
     if app["version"] is None:
-        m = re.search(r'Current Version.*?([0-9]+(?:\.[0-9]+){1,3})', html, re.S)
+        m = re.search(r'\[\[\["([0-9]+(?:\.[0-9]+){1,3})"\]\]\s*,\s*\[\[\[\d', html)
+        if not m:
+            m = re.search(r'Current Version.*?([0-9]+(?:\.[0-9]+){1,3})', html, re.S)
         if not m:
             m = re.search(r'\[\["([0-9]+(?:\.[0-9]+){1,3})"\]\]\s*,\s*"[0-9]', html)
+        if not m:
+            m = re.search(r'(?:Version|\u0412\u0435\u0440\u0441\u0456\u044f)[^\d]{0,40}?"([0-9]+(?:\.[0-9]+){1,3})"', html)
         if m:
             app["version"] = m.group(1)
-    # updated date -> version_date
+    # updated date -> version_date : Play HTML "Updated on</div><div ...>Jun 30, 2026</div>"
     if app["version_date"] is None:
-        m = re.search(r'"(\d{4}-\d{2}-\d{2})T', html)
+        m = re.search(r'(?:Updated on|\u041e\u043d\u043e\u0432\u043b\u0435\u043d\u043e)\s*</div>\s*<div[^>]*>\s*'
+                      r'([A-Za-z\u0410-\u042f\u0430-\u044f\u0456\u0457\u0454\u0491]{3,}\.?\s+\d{1,2},?\s*\d{4}'
+                      r'|\d{1,2}\s+[A-Za-z\u0410-\u042f\u0430-\u044f\u0456\u0457\u0454\u0491]{3,}\.?\s*\d{4})', html)
+        if not m:
+            m = re.search(r'(?:Updated on|\u041e\u043d\u043e\u0432\u043b\u0435\u043d\u043e).{0,40}?'
+                          r'([A-Za-z\u0410-\u042f\u0430-\u044f\u0456\u0457\u0454\u0491]{3,}\.?\s+\d{1,2},?\s*\d{4})', html, re.S)
         if m:
-            yyyymmdd, iso = _iso_to_yyyymmdd(m.group(1))
-            app["version_date"] = yyyymmdd
-            app["version_date_iso"] = iso
+            yyyymmdd, iso = _monthname_to_yyyymmdd(m.group(1))
+            if yyyymmdd:
+                app["version_date"] = yyyymmdd
+                app["version_date_iso"] = iso
+        if app["version_date"] is None:
+            m = re.search(r'"(\d{4}-\d{2}-\d{2})T', html)
+            if m:
+                yyyymmdd, iso = _iso_to_yyyymmdd(m.group(1))
+                app["version_date"] = yyyymmdd
+                app["version_date_iso"] = iso
+    # size \u2014 Play sometimes shows "45 MB" / "1.2 GB" / "512 \u041a\u0411" near "Size"/"\u0420\u043e\u0437\u043c\u0456\u0440"
+    if app["size_text"] is None:
+        m = re.search(r'(?:Size|\u0420\u043e\u0437\u043c\u0456\u0440)[^\d]{0,40}?([\d.,]+)\s*(MB|GB|\u041a\u0411|\u041c\u0411|\u0413\u0411)', html)
+        if not m:
+            m = re.search(r'"([\d.,]+)\s*(MB|GB|\u041c\u0411|\u0413\u0411)"', html)
+        if not m:
+            m = re.search(r'([\d.,]+)\s*(MB|GB|\u041a\u0411|\u041c\u0411|\u0413\u0411)', _visible_text(html))
+        if m:
+            app["size_text"] = (m.group(1) + " " + m.group(2)).strip()
+            app["size_bytes"] = _size_to_bytes(m.group(1), m.group(2))
+    # content_rating \u2014 JSON-LD may have set it; else "Rated for N+" / PEGI / USK / ESRB
+    if app["content_rating"] is None:
+        m = (re.search(r'Rated for (\d+\+)', html)
+             or re.search(r'\b(PEGI\s*\d+)\b', html)
+             or re.search(r'\b(USK[:\s]*\d+)\b', html)
+             or re.search(r'\b(Everyone(?:\s*\d+\+)?|Teen|Mature\s*17\+)\b', html))
+        if m:
+            app["content_rating"] = m.group(1).strip()
+    # genre \u2014 JSON-LD may have set it; else genreId / category text in the blob
+    if app["genre"] is None:
+        m = (re.search(r'"genreId"\s*:\s*"([^"]+)"', html)
+             or re.search(r'/store/apps/category/([A-Z_]+)"', html))
+        if m:
+            app["genre"] = m.group(1)
 
     # raw snippet for optional LLM-fallback
     vt = _visible_text(html)
     if vt:
         app["raw_snippets"].append(vt[:1600])
-    app["found"] = app["rating"] is not None or app["reviews_count"] is not None
+    app["found"] = (app["rating"] is not None or app["reviews_count"] is not None
+                    or bool(app["version"]))
     return app
 
 
@@ -424,4 +565,9 @@ if __name__ == "__main__":
     for a in m["apps"]:
         a2 = dict(a); a2["raw_snippets"] = ["<%d snippets>" % len(a.get("raw_snippets", []))]
         print(json.dumps(a2, ensure_ascii=False, indent=2))
+        print("  >> %s: genre=%r developer=%r version=%r size_text=%r "
+              "content_rating=%r languages_count=%r installs=%r reviews_count=%r" % (
+                  a.get("platform"), a.get("genre"), a.get("developer"), a.get("version"),
+                  a.get("size_text"), a.get("content_rating"), a.get("languages_count"),
+                  a.get("installs"), a.get("reviews_count")))
     print("FOUND:", m["found"], "BUDGET:", m["budget"], "LIB:", m["lib_status"])
