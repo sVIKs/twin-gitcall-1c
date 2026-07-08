@@ -78,10 +78,7 @@ RETRY        = 1           # one retry on failure
 TEXT_CAP     = 40 * 1024   # <=40 KB clean text per page (S2d)
 TIME_BUDGET  = 22.0        # seconds of wall time per git_call window (< 30s node budget)
 BYTE_BUDGET  = 1_000_000   # ~1 MB serialized reply budget (< 1.4 MB node limit)
-# Вежливый бот: честный UA с контактным URL (не Googlebot-спуфинг — reverse-DNS бан
-# положил бы все прогоны с IP офиса). Клиент сам дал URL — прятаться незачем.
-UA           = "SimulatorTwinBot/1.0 (+https://simulator.company/bot)"
-CRAWL_DELAY  = 0.6         # rate-limit: пауза между запросами к ОДНОМУ домену (~1.6 rps)
+UA           = "dto-mf-crawl/1.0 (+deterministic S2 crawler)"
 KNOWN_LANGS  = {"en","ru","uk","az","tr","de","fr","es","it","pl","ka","ar","zh","fa"}
 
 PHONE_RE  = re.compile(r"(?<!\w)(\+?\d[\d\-\s().]{7,17}\d)(?!\w)")
@@ -159,72 +156,6 @@ def _lang_of_path(path):
     return None
 
 
-# --------------------------------------------------------------------------------------
-# ВЕЖЛИВЫЙ БОТ: robots.txt (уважаем Disallow для НАШЕГО UA) + rate-limit per-domain.
-# Всё мягко-degrade: не смогли прочитать robots — считаем разрешено (не блокируем прогон).
-# --------------------------------------------------------------------------------------
-_ROBOTS_CACHE   = {}          # scope_domain -> [disallow-path-prefixes] (lowercase)
-_LAST_HIT       = {}          # scope_domain -> ts последнего запроса (для rate-limit)
-
-
-def _robots_rules(seed):
-    """Fetch /robots.txt once per domain; return list of Disallow prefixes that apply to
-    our UA (SimulatorTwinBot) or '*'. Мягко: сеть/парс упали -> [] (всё разрешено)."""
-    dom = _reg_domain(urlparse(seed).netloc)
-    if dom in _ROBOTS_CACHE:
-        return _ROBOTS_CACHE[dom]
-    rules = []
-    if requests is not None:
-        try:
-            ru = _norm_url(urljoin(seed, "/robots.txt"))
-            r = requests.get(ru, timeout=TIMEOUT, headers={"User-Agent": UA})
-            if r.status_code == 200 and r.text:
-                cur_applies = False
-                for raw in r.text.splitlines():
-                    line = raw.split("#", 1)[0].strip()
-                    if not line or ":" not in line:
-                        continue
-                    field, _, val = line.partition(":")
-                    field = field.strip().lower(); val = val.strip()
-                    if field == "user-agent":
-                        ua = val.lower()
-                        cur_applies = (ua == "*" or "simulatortwinbot" in ua)
-                    elif field == "disallow" and cur_applies:
-                        if val:
-                            rules.append(val.lower())
-        except Exception:
-            rules = []
-    _ROBOTS_CACHE[dom] = rules
-    return rules
-
-
-def _robots_allowed(url, seed):
-    """True if robots.txt does not Disallow this URL path for our UA."""
-    rules = _robots_rules(seed)
-    if not rules:
-        return True
-    path = (urlparse(url).path or "/").lower()
-    for pref in rules:
-        if pref == "/" or path.startswith(pref):
-            return False
-    return True
-
-
-def _rate_limit(url):
-    """Sleep so we never hit the SAME domain faster than CRAWL_DELAY (~1-2 rps)."""
-    dom = _reg_domain(urlparse(url).netloc)
-    last = _LAST_HIT.get(dom)
-    now = time.time()
-    if last is not None:
-        wait = CRAWL_DELAY - (now - last)
-        if wait > 0:
-            try:
-                time.sleep(min(wait, CRAWL_DELAY))
-            except Exception:
-                pass
-    _LAST_HIT[dom] = time.time()
-
-
 # Богатые заголовки браузера — снимают наивные блоки (без TLS-fingerprint это слабо, но дёшево).
 _HDRS = {
     "User-Agent": UA,
@@ -253,7 +184,6 @@ def _fetch(url):
     Стабильно: экспоненциальный backoff на 429/503, мягкий fallback, graceful на ошибке.
     Returns (status, ctype, text, bytes, elapsed_ms, err)."""
     last = "unknown"
-    _rate_limit(url)                   # вежливость: не быстрее CRAWL_DELAY на домен
     # Ступень 1: обычный requests + backoff (покрывает ~80% сайтов)
     if requests is not None:
         for attempt in range(RETRY + 1):  # 0,1
@@ -497,33 +427,15 @@ def _crawl(seed, max_pages, snapshot, cursor):
     web_ok = False
     out_bytes = 0
 
-    # snapshot re-run: extract FROM the frozen snapshot, no GET (P4 reproducibility, golden-run).
-    # Two accepted per-URL shapes (deterministic, sorted URL order):
-    #   {url: "clean text"}                    — back-compat (text-only)
-    #   {url: {"text": "...", "html": "..."}}  — RICH golden fixture (faithful live-run replay:
-    #                                            html feeds ld+json entities + socials/contacts)
+    # snapshot re-run: extract from provided text, no GET (P4 reproducibility)
     if snapshot and isinstance(snapshot, dict) and snapshot:
-        for u in sorted(snapshot.keys()):      # CANONICAL order for reproducibility
-            rec = snapshot[u]
-            if isinstance(rec, dict):
-                txt = rec.get("text") or ""
-                html = rec.get("html") or ""
-                title = rec.get("title") or _title(html)
-            else:
-                txt = rec or ""
-                html = ""
-                title = ""
-            if not txt and html:
-                txt = _clean_text(html)
-            entities += _entities_from_structured(u, html)
-            p, e, s = _contacts(u, txt, html)
+        for u, txt in snapshot.items():
+            entities += _entities_from_structured(u, "")   # no html; ld+json unlikely in text
+            p, e, s = _contacts(u, txt, "")
             for x in p: ph_all.setdefault(x, []).append(u)
             for x in e: em_all.setdefault(x, []).append(u)
             for x in s: so_all.setdefault(x, []).append(u)
             text_by_url[u] = txt[:TEXT_CAP]
-            pages.append({"url": u, "status": 200, "content_type": "text/html",
-                          "bytes": len(html or ""), "elapsed_ms": 0,
-                          "title": title, "err": ""})
         return _assemble(True, scope_domain, base_lang, pages, entities, ph_all,
                          em_all, so_all, text_by_url, None, True, errors, t_start, "snapshot")
 
@@ -540,12 +452,6 @@ def _crawl(seed, max_pages, snapshot, cursor):
         if url in visited_set:
             continue
         visited_set.add(url); visited.append(url)
-        if not _robots_allowed(url, seed):     # вежливость: уважаем Disallow для нашего UA
-            errors.append("%s -> robots-disallow" % url)
-            pages.append({"url": url, "status": 0, "content_type": "", "bytes": 0,
-                          "elapsed_ms": 0, "title": "", "err": "robots-disallow"})
-            pages_done += 1
-            continue
         status, ctype, html, nbytes, ms, err = _fetch(url)
         rec = {"url": url, "status": status, "content_type": ctype,
                "bytes": nbytes, "elapsed_ms": ms, "title": "", "err": err}
@@ -688,12 +594,6 @@ def _page(url):
     t0 = time.time()
     url = _norm_url(url)
     scope_domain = _reg_domain(urlparse(url).netloc)
-    if not _robots_allowed(url, url):          # вежливость: уважаем Disallow для нашего UA
-        return {"mode": "page", "web_ok": False, "url": url, "title": "",
-                "text": "", "structured_entities": [], "links": [],
-                "regex_hits": {"phones": [], "emails": [], "socials": []},
-                "errors": ["%s -> robots-disallow" % url],
-                "budget": {"elapsed_s": round(time.time() - t0, 2)}}
     status, ctype, html, nbytes, ms, err = _fetch(url)
     if err or not html:
         return {"mode": "page", "web_ok": False, "url": url, "title": "",
