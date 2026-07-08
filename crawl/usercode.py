@@ -55,6 +55,19 @@ try:
     LIB["phonenumbers"] = getattr(phonenumbers, "__version__", "?")
 except Exception as e:
     phonenumbers = None; LIB["phonenumbers"] = "ERR:%s" % e
+# curl_cffi — TLS-impersonate (проходит Cloudflare на TLS-слое); мягкий fallback на requests
+try:
+    from curl_cffi import requests as _CREQ
+    import curl_cffi as _ccffi
+    LIB["curl_cffi"] = getattr(_ccffi, "__version__", "?")
+except Exception as e:
+    _CREQ = None; LIB["curl_cffi"] = "ERR:%s" % str(e)[:60]
+# signal — жёсткий watchdog, чтобы git_call не висел > платформенного лимита
+try:
+    import signal as _signal
+    LIB["signal"] = "ok"
+except Exception as e:
+    _signal = None; LIB["signal"] = "ERR:%s" % str(e)[:60]
 
 from urllib.parse import urlparse, urljoin, urldefrag
 
@@ -143,24 +156,68 @@ def _lang_of_path(path):
     return None
 
 
+# Богатые заголовки браузера — снимают наивные блоки (без TLS-fingerprint это слабо, но дёшево).
+_HDRS = {
+    "User-Agent": UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "uk-UA,uk;q=0.9,ru;q=0.8,en;q=0.6",
+    "Accept-Encoding": "gzip, deflate",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+
+def _ok_html(r, t0):
+    ms = int((time.time() - t0) * 1000)
+    ctype = (r.headers.get("Content-Type") or "").lower()
+    try:
+        body_bytes = len(r.content or b"")
+    except Exception:
+        body_bytes = 0
+    if "text/html" not in ctype and "application/xhtml" not in ctype:
+        return (r.status_code, ctype, "", body_bytes, ms, "not-html")
+    return (r.status_code, ctype, r.text, body_bytes, ms, "")
+
+
 def _fetch(url):
-    """GET one page. Returns (status, ctype, text, bytes, elapsed_ms, err)."""
-    if requests is None:
-        return (0, "", "", 0, 0, "requests-missing")
+    """GET one page — ЛЕСТНИЦА: requests(+backoff) -> curl_cffi(TLS-impersonate).
+    Стабильно: экспоненциальный backoff на 429/503, мягкий fallback, graceful на ошибке.
+    Returns (status, ctype, text, bytes, elapsed_ms, err)."""
     last = "unknown"
-    for attempt in range(RETRY + 1):
+    # Ступень 1: обычный requests + backoff (покрывает ~80% сайтов)
+    if requests is not None:
+        for attempt in range(RETRY + 1):  # 0,1
+            t0 = time.time()
+            try:
+                r = requests.get(url, timeout=TIMEOUT, headers=_HDRS, allow_redirects=True)
+                sc = r.status_code
+                if sc == 200:
+                    return _ok_html(r, t0)
+                if sc == 403:
+                    last = "http-403 (cloudflare?)"
+                    break  # -> curl_cffi (TLS)
+                if sc in (429, 503):
+                    try:
+                        time.sleep(min(2 ** attempt, 6))  # backoff 1s,2s
+                    except Exception:
+                        pass
+                    last = "http-%d" % sc
+                    continue
+                return (sc, (r.headers.get("Content-Type") or "").lower(), "",
+                        len(r.content or b""), int((time.time() - t0) * 1000), "http-%d" % sc)
+            except Exception as e:
+                last = "%s: %s" % (type(e).__name__, str(e)[:150])
+    # Ступень 2: curl_cffi (TLS-impersonate Chrome) — проходит Cloudflare на TLS-слое
+    if _CREQ is not None:
         t0 = time.time()
         try:
-            r = requests.get(url, timeout=TIMEOUT, headers={"User-Agent": UA},
-                             allow_redirects=True)
-            ms = int((time.time() - t0) * 1000)
-            ctype = (r.headers.get("Content-Type") or "").lower()
-            body_bytes = len(r.content or b"")
-            if "text/html" not in ctype and "application/xhtml" not in ctype:
-                return (r.status_code, ctype, "", body_bytes, ms, "not-html")
-            return (r.status_code, ctype, r.text, body_bytes, ms, "")
+            r = _CREQ.get(url, timeout=TIMEOUT, headers={"User-Agent": UA},
+                          impersonate="chrome", allow_redirects=True)
+            if getattr(r, "status_code", 0) == 200:
+                return _ok_html(r, t0)
+            last = "curl_cffi-%s" % getattr(r, "status_code", "?")
         except Exception as e:
-            last = "%s: %s" % (type(e).__name__, str(e)[:200])
+            last = "curl_cffi-fail: %s" % (type(e).__name__)
     return (0, "", "", 0, 0, last)
 
 
@@ -565,6 +622,18 @@ def _page(url):
 
 
 def handle(data):
+    # WATCHDOG: жёсткий таймаут 28с (< платформенного лимита git_call) — гарантирует ВОЗВРАТ
+    # (иначе узел висит in=1/out=0 при медленном/зацикленном fetch). При срабатывании — graceful.
+    _armed = False
+    if _signal is not None:
+        def _wd(signum, frame):
+            raise TimeoutError("git_call watchdog: exceeded 28s")
+        try:
+            _signal.signal(_signal.SIGALRM, _wd)
+            _signal.alarm(28)
+            _armed = True
+        except Exception:
+            _armed = False
     try:
         url = data.get("url") or data.get("source_url") or ""
         mode = (data.get("mode") or "").strip().lower()
@@ -587,10 +656,20 @@ def handle(data):
         snapshot = data.get("snapshot") or None
         cursor = data.get("cursor") or None
         data["crawl"] = _crawl(url, max_pages, snapshot, cursor)
+    except TimeoutError as e:
+        # watchdog: вернуть управляемый ответ, НЕ зависать
+        data["crawl"] = {"web_ok": False, "done": True, "cursor": None, "lib_status": LIB,
+                         "timeout": True, "errors": ["WATCHDOG: %s" % str(e)]}
     except Exception as e:
         data["crawl"] = {"web_ok": False, "done": True, "cursor": None,
                          "lib_status": LIB,
                          "errors": ["FATAL: %s" % e, traceback.format_exc()[:1500]]}
+    finally:
+        if _armed:
+            try:
+                _signal.alarm(0)
+            except Exception:
+                pass
     return data
 
 
