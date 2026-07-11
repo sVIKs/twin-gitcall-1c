@@ -22,6 +22,7 @@ Task data OUT (added under data.sdf):
             attrs,source_quote,image_url,links}  — контракт site-run INLINE parse.
 """
 import re, json, time, traceback
+import html as _HTML
 from urllib.parse import urlparse
 
 LIB = {}
@@ -330,11 +331,88 @@ def _extract_og(html, url, parent_hint):
     }], 1
 
 
+# ---------------- tier 4: embedded storefront state (Shopify Hydrogen / Storefront-API / headless) --------
+# Headless e-commerce (Shopify Hydrogen, Next.js commerce) NE несёт JSON-LD/microdata/OG-price,
+# а embedded state в HTML: {"price":{"amount":"160.0","currencyCode":"GBP"}, ... ,"product":{"title":...}}.
+# Часто HTML-entity-encoded (&quot;). Детерминированно вытаскиваем price+currency+title без LLM.
+_PRICE_OBJ = re.compile(
+    r'"price"\s*:\s*\{\s*"amount"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)"?\s*,\s*"currencyCode"\s*:\s*"([A-Za-z]{3})"',
+    re.S)
+_TITLE_AFTER = re.compile(r'"product"\s*:\s*\{\s*"title"\s*:\s*"((?:[^"\\]|\\.){1,250})"', re.S)
+_COMPARE_OBJ = re.compile(
+    r'"compareAtPrice"\s*:\s*\{\s*"amount"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)"?', re.S)
+_AVAIL = re.compile(r'"availableForSale"\s*:\s*(true|false)', re.I)
+_HANDLE = re.compile(r'"handle"\s*:\s*"([a-zA-Z0-9_\-]{1,120})"')
+
+
+def _extract_embedded(html, url, parent_hint):
+    """Parse embedded storefront-state JSON (entity-decoded). Returns compact product entities."""
+    out, cnt, seen = [], 0, set()
+    dec = _HTML.unescape(html)
+    # Ограничиваем область — только фрагменты рядом с price-объектами (дешевле, чем весь HTML JSON.loads).
+    for m in _PRICE_OBJ.finditer(dec):
+        amt, cur = m.group(1), m.group(2).upper()
+        pn = _price_num(amt)
+        if pn is None or pn <= 0:
+            continue
+        # окно после price для product.title (в Shopify state идёт следом)
+        win = dec[m.start():m.start() + 2000]
+        tm = _TITLE_AFTER.search(win)
+        title = ""
+        if tm:
+            title = tm.group(1)
+            try:
+                title = json.loads('"' + title + '"')
+            except Exception:
+                title = title.replace('\\"', '"').replace('\\/', '/')
+        if not title:
+            # фолбэк-название из og:title / <title> (один товар на страницу)
+            om = re.search(r'(?:property|name)=["\']og:title["\'][^>]*content=["\']([^"\']+)', html, re.I)
+            if om:
+                title = om.group(1).strip()
+            else:
+                hm = re.search(r'<title[^>]*>([^<|]+)', html, re.I)
+                title = (hm.group(1).strip() if hm else "")
+        title = title.strip()[:250]
+        if not title:
+            continue
+        k = title.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        acc = {"Ціна": pn}
+        attrs = {"Валюта": cur}
+        # compareAtPrice — исходная цена (до скидки)
+        cw = dec[max(0, m.start() - 600):m.start() + 200]
+        cm = _COMPARE_OBJ.search(cw)
+        if cm:
+            cpn = _price_num(cm.group(1))
+            if cpn is not None and cpn > pn:
+                acc["Ціна до знижки"] = cpn
+        # наличие
+        aw = dec[max(0, m.start() - 800):m.start() + 200]
+        am = _AVAIL.search(aw)
+        if am:
+            attrs["Наявність"] = "InStock" if am.group(1).lower() == "true" else "OutOfStock"
+        cnt += 1
+        out.append({
+            "class": "product", "key_fields": {"title": title}, "title": title,
+            "value": ("%s %s" % (amt, cur)),
+            "confidence": 0.85, "source_url": url, "parent": parent_hint,
+            "accounts": acc, "attrs": attrs,
+            "source_quote": ("[embedded] %s — %s %s" % (title, amt, cur))[:300],
+            "image_url": "", "links": [],
+        })
+        if cnt >= MAX_ENTITIES:
+            break
+    return out, cnt
+
+
 def _run_sdf(data):
     url = _norm_url(data.get("url") or data.get("curUrl") or data.get("source_url") or "")
     src_url = str(data.get("source_url") or url)
     parent_hint = str(data.get("business_hint") or data.get("cName") or "")
-    res = {"ok": False, "count": 0, "sources": {"jsonld": 0, "microdata": 0, "og": 0},
+    res = {"ok": False, "count": 0, "sources": {"jsonld": 0, "microdata": 0, "og": 0, "embedded": 0},
            "entities": [], "err": "", "lib_status": LIB}
     if not url:
         res["err"] = "no url"
@@ -354,6 +432,11 @@ def _run_sdf(data):
     if not ents:
         ents, c3 = _extract_og(html, src_url, parent_hint)
         res["sources"]["og"] = c3
+    # tier 4: embedded storefront state (Shopify Hydrogen / headless) — только если ещё пусто.
+    # Часто несёт цену там, где нет JSON-LD/microdata/OG (напр. hiutdenim.co.uk).
+    if not ents:
+        ents, c4 = _extract_embedded(html, src_url, parent_hint)
+        res["sources"]["embedded"] = c4
     ents = ents[:MAX_ENTITIES]
     res["entities"] = ents
     res["count"] = len(ents)
