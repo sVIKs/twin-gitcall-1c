@@ -331,7 +331,7 @@ def _extract_og(html, url, parent_hint):
 
 
 def _run_sdf(data):
-    url = _norm_url(data.get("url") or data.get("curUrl") or "")
+    url = _norm_url(data.get("url") or data.get("curUrl") or data.get("source_url") or "")
     src_url = str(data.get("source_url") or url)
     parent_hint = str(data.get("business_hint") or data.get("cName") or "")
     res = {"ok": False, "count": 0, "sources": {"jsonld": 0, "microdata": 0, "og": 0},
