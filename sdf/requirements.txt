@@ -1,4 +1,2 @@
 curl_cffi>=0.7
-trafilatura>=1.8
-lxml
-beautifulsoup4
+requests

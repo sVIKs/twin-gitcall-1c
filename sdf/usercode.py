@@ -361,7 +361,7 @@ def _run_sdf(data):
     return res
 
 
-def usercode(data):
+def handle(data):
     if not isinstance(data, dict):
         data = {}
     try:
@@ -378,7 +378,7 @@ if __name__ == "__main__":
     import sys
     d = {"url": sys.argv[1] if len(sys.argv) > 1 else "https://www.manduka.com/products/prolite-yoga-mat",
          "business_hint": "Manduka"}
-    out = usercode(d)["sdf"]
+    out = handle(d)["sdf"]
     print("ok=%s count=%s sources=%s err=%s" % (out["ok"], out["count"], out["sources"], out["err"]))
     for e in out["entities"][:5]:
         print("  •", e["title"], "| acc:", e["accounts"], "| attrs:", e["attrs"])
