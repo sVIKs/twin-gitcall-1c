@@ -34,7 +34,9 @@ Contract (git_call calls handle(data)):
   Mirrors text/file_name/kb/format/mode to top-level.
 Окно git_call ≤30с / reply ≤1.4МБ: structural mode keeps both bounded regardless of file size.
 """
-import os, sys, json, base64, tempfile, time, traceback
+import os, sys, json, base64, tempfile, time, traceback, hashlib, re
+from decimal import Decimal, InvalidOperation
+from datetime import date, datetime
 from urllib.request import urlretrieve
 
 LIB = {}
@@ -341,7 +343,393 @@ def _txt(path, cfg):
     return out, None, None, None, {"chars": len(txt)}, True
 
 
+# =========================================================================================
+# mode="load" — ДЕТЕРМІНОВАНИЙ ПОРЯДКОВИЙ ПАРСЕР (степпер) по MappingContract → entities[].
+# Жодного AI. Числа/гроші — ТІЛЬКИ Decimal/строка (НЕ float). Резюмівний cursor {sheet,offset,tableIdx}.
+# Контракт adapter (OUT.entities[]):
+#   {class, title, code?, data{}, accounts:[{name, amount(str Decimal), currency, kind, unit}],
+#    links:[{fromValue, toFileTable, toKeyCol, edge_type}]}
+# MappingContract (IN):
+#   {locale: {decimal: "," | "."}, ref_template (глобальний, опц.),
+#    tables: [{sheet? | tableIdx?, name?, header_row(деф 1),
+#      rowEntity: {class, ref_template, title_col, skip_if?},
+#      columns: [{col, role: key|attr|account|link|ignore,
+#                 account_name?, unit?, kind?, currency?,          # role=account
+#                 to_table?, to_key?, edge_type?,                  # role=link
+#                 date? (bool)}]}]}
+# Вікно: chunk_rows (деф 200) АБО ~25с — що раніше. cursor.offset += видано в поточній таблиці.
+# =========================================================================================
+
+LOAD_TIME_BUDGET_S = 25.0
+DEF_CHUNK_ROWS = 200
+_NUM_CLEAN_RE = re.compile(r"[^\d,.\-]")
+
+
+def _to_json(v):
+    """Приймає dict АБО JSON-строку (Corezoid api_rpc часто передає JSON-строкою)."""
+    if isinstance(v, (dict, list)):
+        return v
+    if isinstance(v, str) and v.strip():
+        try:
+            return json.loads(v)
+        except ValueError:
+            return None
+    return None
+
+
+def _norm_number(raw, decimal_sep="."):
+    """Строка/число → канонічна Decimal-строка. НІКОЛИ float. Локаль з contract.
+    Повертає (decimal_str|None, ok:bool). Порожнє → ('0', True)? Ні — порожнє → (None,False)
+    щоб не вигадувати; викликаючий вирішує (account з None-сумою → пропускаємо суму)."""
+    if raw is None:
+        return None, False
+    if isinstance(raw, bool):
+        return None, False
+    if isinstance(raw, int):
+        return str(raw), True
+    if isinstance(raw, Decimal):
+        return format(raw, "f"), True
+    if isinstance(raw, float):
+        # float на вході (напр. openpyxl без int) — через str, не через binary float
+        try:
+            return format(Decimal(repr(raw)), "f"), True
+        except (InvalidOperation, ValueError):
+            return None, False
+    s = str(raw).strip()
+    if not s:
+        return None, False
+    # прибрати валютні символи/пробіли-роздільники тисяч, лишити цифри/,/./-
+    s = _NUM_CLEAN_RE.sub("", s)
+    if not s or s in ("-", ".", ","):
+        return None, False
+    if decimal_sep == ",":
+        # кома — десятковий; крапка — роздільник тисяч
+        s = s.replace(".", "").replace(",", ".")
+    else:
+        # крапка — десятковий; кома — роздільник тисяч
+        s = s.replace(",", "")
+    try:
+        return format(Decimal(s), "f"), True
+    except (InvalidOperation, ValueError):
+        return None, False
+
+
+def _norm_date(raw):
+    """Дата → isoformat (YYYY-MM-DD). Приймає datetime/date/строку. None якщо не дата."""
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, datetime):
+        return raw.date().isoformat()
+    if isinstance(raw, date):
+        return raw.isoformat()
+    s = str(raw).strip()
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y", "%Y/%m/%d", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(s, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return s  # лишаємо як є (честно), не вигадуємо
+
+
+def _slug(v):
+    """Детермінований slug для ref (стабільний → ідемпотентність)."""
+    s = str(v or "").strip().lower()
+    s = re.sub(r"[^\w]+", "-", s, flags=re.UNICODE).strip("-")
+    return s or hashlib.sha1(str(v).encode("utf-8")).hexdigest()[:10]
+
+
+def _make_ref(tmpl, key_value, cls):
+    """ref_template з плейсхолдерами {key} / {class} / {slug}. Без шаблону → class-slug."""
+    kv = _slug(key_value)
+    if tmpl:
+        return (tmpl.replace("{key}", str(key_value or ""))
+                    .replace("{slug}", kv)
+                    .replace("{class}", _slug(cls)))
+    return "%s-%s" % (_slug(cls), kv)
+
+
+def _xlsx_rows_window(path, sheet_name, header_row, offset, chunk_rows, t0):
+    """Стрім рядків одного листа: (headers, [(row_cells)], produced, exhausted).
+    read_only + iter_rows(values_only). Вікно: chunk_rows АБО час."""
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    ws = None
+    if sheet_name:
+        for w in wb.worksheets:
+            if w.title == sheet_name:
+                ws = w; break
+        if ws is None:
+            wb.close()
+            raise KeyError("sheet %r not found" % sheet_name)
+    else:
+        ws = wb.worksheets[0]
+    headers = None
+    out_rows = []
+    produced = 0
+    exhausted = True
+    # min_row у openpyxl 1-based; header_row-й рядок = заголовок, дані з header_row+1
+    start_data = header_row + 1 + offset
+    ri = 0
+    for row in ws.iter_rows(min_row=1, values_only=True):
+        ri += 1
+        if ri == header_row:
+            headers = [("" if c is None else str(c).strip()) for c in row]
+            continue
+        if ri < start_data:
+            continue
+        cells = list(row)
+        # порожній рядок — пропускаємо (не рахуємо в offset споживання даних? рахуємо як прочитаний)
+        if not any(("" if c is None else str(c)).strip() for c in cells):
+            continue
+        out_rows.append(cells)
+        produced += 1
+        if produced >= chunk_rows or (time.time() - t0) >= LOAD_TIME_BUDGET_S:
+            exhausted = False
+            break
+    else:
+        exhausted = True
+    if headers is None:
+        headers = []
+    wb.close()
+    return headers, out_rows, produced, exhausted
+
+
+def _docx_rows_window(path, table_idx, header_row, offset, chunk_rows, t0):
+    """Рядки таблиці docx (одномоментно читаємо всю таблицю — вони малі; вікно на видачу)."""
+    d = docx.Document(path)
+    if table_idx >= len(d.tables):
+        raise KeyError("tableIdx %d out of range (%d tables)" % (table_idx, len(d.tables)))
+    tbl = d.tables[table_idx]
+    all_rows = [[c.text.strip() for c in r.cells] for r in tbl.rows]
+    if not all_rows:
+        return [], [], 0, True
+    headers = all_rows[header_row - 1] if len(all_rows) >= header_row else all_rows[0]
+    body = all_rows[header_row:]  # після заголовка
+    window = body[offset: offset + chunk_rows]
+    exhausted = (offset + len(window)) >= len(body)
+    return headers, window, len(window), exhausted
+
+
+def _apply_contract(headers, row_cells, tbl_contract, locale_sep, acc, sums, unmatched):
+    """Один рядок → entity по MappingContract (детерміновано). Оновлює acc/sums/unmatched.
+    Повертає (entity|None, twin_error|None)."""
+    # індекс колонки по імені (як у файлі)
+    col_idx = {h: i for i, h in enumerate(headers)}
+
+    def cell(colname):
+        i = col_idx.get(colname)
+        if i is None or i >= len(row_cells):
+            return None
+        v = row_cells[i]
+        return v
+
+    re_ = tbl_contract["rowEntity"]
+    cls = re_["class"]
+    ref_tmpl = re_.get("ref_template") or tbl_contract.get("_ref_template_global")
+    title_col = re_.get("title_col")
+
+    # skip_if: {col, equals} — детерміноване пропускання
+    skip = re_.get("skip_if")
+    if skip:
+        sv = cell(skip.get("col"))
+        if str(sv).strip() == str(skip.get("equals", "")).strip():
+            return None, None
+
+    entity = {"class": cls, "title": "", "data": {}, "accounts": [], "links": []}
+    key_value = None
+
+    for c in tbl_contract["columns"]:
+        colname = c["col"]
+        if colname not in col_idx:
+            # колонка контракту відсутня у файлі — чесна помилка
+            return None, "колонка '%s' відсутня у файлі (headers=%s)" % (colname, headers)
+        role = c.get("role", "ignore")
+        raw = cell(colname)
+
+        if role == "ignore":
+            continue
+        if role == "key":
+            key_value = ("" if raw is None else str(raw).strip())
+            entity["code"] = key_value
+            entity["data"][colname] = key_value
+        elif role == "attr":
+            if c.get("date"):
+                entity["data"][colname] = _norm_date(raw)
+            else:
+                entity["data"][colname] = ("" if raw is None else str(raw).strip())
+        elif role == "account":
+            amt, ok = _norm_number(raw, locale_sep)
+            if ok:
+                a = {"name": c.get("account_name") or colname,
+                     "amount": amt,   # СТРОКА Decimal
+                     "currency": c.get("currency") or "one",
+                     "kind": c.get("kind") or "fact",
+                     "unit": c.get("unit") or ""}
+                entity["accounts"].append(a)
+                # акумулюємо суму для baseline-звірки
+                prev = sums.get(a["name"], Decimal("0"))
+                sums[a["name"]] = prev + Decimal(amt)
+        elif role == "link":
+            fv = ("" if raw is None else str(raw).strip())
+            if fv:
+                entity["links"].append({
+                    "fromValue": fv,
+                    "toFileTable": c.get("to_table"),
+                    "toKeyCol": c.get("to_key"),
+                    "edge_type": c.get("edge_type") or "related",
+                })
+
+    if title_col is not None:
+        tv = cell(title_col)
+        entity["title"] = ("" if tv is None else str(tv).strip())
+    if not entity["title"]:
+        entity["title"] = entity.get("code") or ""
+
+    if not key_value:
+        unmatched[0] += 1  # рядок без ключа — рахуємо, не мовчимо
+        # все одно віддаємо (adapter може дедупити), але позначимо
+        entity["_no_key"] = True
+
+    ref = _make_ref(ref_tmpl, key_value or entity["title"], cls)
+    entity["ref"] = ref
+    acc["count"] += 1
+    return entity, None
+
+
+def _load(data):
+    """mode=load: віддає наступний чанк entities[] + cursor. Резюмівно, детерміновано."""
+    contract = _to_json(data.get("mapping_contract"))
+    if not isinstance(contract, dict):
+        return {"twin_error": "mapping_contract required (dict|json)", "entities": [],
+                "cursor": {}, "done": True, "count": 0}
+    cursor = _to_json(data.get("cursor")) or {}
+    if not isinstance(cursor, dict):
+        cursor = {}
+    chunk_rows = _int(data.get("chunk_rows"), DEF_CHUNK_ROWS)
+    locale = contract.get("locale") or {}
+    locale_sep = locale.get("decimal", ".")
+    ref_tmpl_global = contract.get("ref_template")
+    tables = contract.get("tables") or []
+    if not tables:
+        return {"twin_error": "mapping_contract.tables empty", "entities": [],
+                "cursor": {}, "done": True, "count": 0}
+
+    # прокинути глобальний ref_template у кожну таблицю (fallback)
+    for t in tables:
+        t.setdefault("_ref_template_global", ref_tmpl_global)
+
+    path, name, tmp_created = None, None, False
+    t0 = time.time()
+    try:
+        path, name, tmp_created = _materialize(data)
+        fmt = _detect(path, name)
+
+        tbl_i = int(cursor.get("tableIdx", 0))
+        offset = int(cursor.get("offset", 0))
+
+        acc = {"count": 0}
+        sums = {}          # accountName -> Decimal (у ЦЬОМУ чанку)
+        source_counts = {} # sheet/table -> produced rows (у ЦЬОМУ чанку)
+        unmatched = [0]
+        entities = []
+        twin_error = None
+
+        # пройти таблиці контракту, поки не наберемо вікно або не вичерпаємо всі
+        done = False
+        while tbl_i < len(tables):
+            tc = tables[tbl_i]
+            header_row = _int(tc.get("header_row"), 1)
+            if fmt in ("xlsx", "xlsm"):
+                if openpyxl is None:
+                    raise RuntimeError("openpyxl unavailable")
+                sheet_name = tc.get("sheet")
+                headers, rows, produced, exhausted = _xlsx_rows_window(
+                    path, sheet_name, header_row, offset, chunk_rows - acc["count"], t0)
+                sc_key = sheet_name or "sheet0"
+            elif fmt == "docx":
+                if docx is None:
+                    raise RuntimeError("python-docx unavailable")
+                table_idx = _int(tc.get("tableIdx"), 0) if tc.get("tableIdx") is not None else 0
+                headers, rows, produced, exhausted = _docx_rows_window(
+                    path, table_idx, header_row, offset, chunk_rows - acc["count"], t0)
+                sc_key = "table%d" % table_idx
+            else:
+                raise RuntimeError("mode=load: формат '%s' не підтримується (xlsx/docx)" % fmt)
+
+            for rc in rows:
+                ent, err = _apply_contract(headers, rc, tc, locale_sep, acc, sums, unmatched)
+                if err:
+                    twin_error = err
+                    break
+                if ent is not None:
+                    entities.append(ent)
+            source_counts[sc_key] = source_counts.get(sc_key, 0) + produced
+
+            if twin_error:
+                break
+
+            if exhausted:
+                # ця таблиця вичерпана → наступна з offset 0
+                tbl_i += 1
+                offset = 0
+                if tbl_i >= len(tables):
+                    done = True
+                    break
+                # якщо вже набрали вікно — стоп (наступна таблиця у наступному виклику)
+                if acc["count"] >= chunk_rows or (time.time() - t0) >= LOAD_TIME_BUDGET_S:
+                    break
+            else:
+                # таблиця не вичерпана → зсуваємо offset у ній, вікно закрите
+                offset += produced
+                break
+
+        next_cursor = {"tableIdx": tbl_i, "offset": offset}
+        out = {
+            "entities": entities,
+            "cursor": (next_cursor if not done else {"tableIdx": tbl_i, "offset": 0, "done": True}),
+            "done": bool(done),
+            "format": fmt,
+            "count": len(entities),
+            "source_counts": source_counts,
+            "sums": {k: format(v, "f") for k, v in sums.items()},  # СТРОКИ Decimal
+            "unmatched": unmatched[0],
+            "twin_error": twin_error,
+        }
+        return out
+    except Exception as e:
+        return {"twin_error": "%s: %s" % (type(e).__name__, str(e)[:300]),
+                "twin_trace": traceback.format_exc()[-1000:],
+                "entities": [], "cursor": {}, "done": True, "count": 0}
+    finally:
+        if tmp_created and path:
+            try:
+                os.unlink(path)
+            except Exception:
+                pass
+
+
 def handle(data, context=None):
+    # ---- mode=load: окрема детермінована гілка (степпер по MappingContract) ----
+    if (data.get("mode") or "").lower() == "load":
+        res = _load(data)
+        for k in ("file_b64", "content_b64", "base64", "file_b64_parts"):
+            if k in data:
+                try:
+                    del data[k]
+                except Exception:
+                    data[k] = ""
+        data["entities"] = res.get("entities", [])
+        data["cursor"] = res.get("cursor", {})
+        data["done"] = bool(res.get("done", True))
+        data["format"] = res.get("format", "")
+        data["count"] = res.get("count", 0)
+        data["source_counts"] = res.get("source_counts", {})
+        data["sums"] = res.get("sums", {})
+        data["unmatched"] = res.get("unmatched", 0)
+        data["twin_error"] = res.get("twin_error")
+        if res.get("twin_trace"):
+            data["twin_trace"] = res["twin_trace"]
+        return data
+
     cfg = {
         "maxChars": _int(data.get("maxChars"), DEF_MAX_CHARS),
         "maxKb": _int(data.get("maxKb"), DEF_MAX_KB),
